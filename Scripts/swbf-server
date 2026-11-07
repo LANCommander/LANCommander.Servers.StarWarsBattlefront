@@ -1,0 +1,150 @@
+#!/bin/sh
+# Start the Star Wars: Battlefront dedicated server (START_EXE).
+#
+# There is no separate server program: Battlefront.exe hosts a dedicated server with
+# `/autonet dedicated`. This runs it from GameData/ under Wine with /norender and /nosound, so it needs
+# no display, and /lan, which makes it host on the LAN (UDP 3658, LAN browser on 3657) instead of
+# through GOG Galaxy. The map rotation comes last on the command line.
+#
+# The game prints nothing to stdout and writes no log. SWBF_EXTRA_ARGS and any START_ARGS are added
+# before the maps.
+set -e
+
+# START_ARGS arrive as arguments; keep them before the map parsing below reuses "$@"
+start_args="$*"
+
+root="${SERVER_ROOT:-/config/Merged}"
+game="$root/GameData"
+
+if [ ! -f "$game/Battlefront.exe" ]; then
+    echo "GameData/Battlefront.exe not found in $root. Put a Star Wars: Battlefront install in /config/Server." >&2
+    exit 1
+fi
+
+is_true() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_number() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# A map code is <world><n><side>, e.g. bes2r: the level file is <world><n>.lvl in Data/_LVL_PC/<WORLD>/,
+# or in an add-on under AddOn/. The side letter picks the era: r (Republic) / c (CIS) for the Clone Wars,
+# i (Empire) / a (Alliance) for the Galactic Civil War, and each map has only the codes listed here
+# (from mission.lvl, plus the Jabba's Palace add-on). Battlefront crashes on a map it doesn't know, so
+# check them all before starting. Codes that aren't stock are accepted if their level is in AddOn/
+# (mod maps).
+STOCK_MAPS=" bes1a bes1r bes2a bes2r end1a geo1r hot1i kam1c kas1c kas1i kas2c kas2i nab1c nab1i nab2a nab2c rhn1i rhn1r rhn2a rhn2c tat1i tat1r tat2i tat2r tat3a tat3c yav1c yav1i yav2i yav2r "
+
+level_installed() {
+    find "$game/Data/_LVL_PC" "$game/AddOn" -maxdepth 5 -type f -iname "$1.lvl" 2>/dev/null | grep -q .
+}
+
+check_map() {
+    level="$(printf '%s' "$1" | sed 's/.$//')"
+    case "$STOCK_MAPS" in
+        *" $1 "*)
+            level_installed "$level" && return 0
+            echo "SWBF_MAPS: map '$1' is not installed (no $level.lvl under GameData/Data/_LVL_PC or GameData/AddOn)." >&2
+            return 1
+            ;;
+    esac
+    if find "$game/AddOn" -maxdepth 5 -type f -iname "$level.lvl" 2>/dev/null | grep -q .; then
+        echo "SWBF_MAPS: '$1' is not a stock map; using the add-on level $level.lvl" >&2
+        return 0
+    fi
+    if level_installed "$level"; then
+        echo "SWBF_MAPS: '$1' has the wrong era letter for $level. Stock codes:$STOCK_MAPS" >&2
+    else
+        echo "SWBF_MAPS: unknown map '$1'. Stock codes:$STOCK_MAPS" >&2
+    fi
+    return 1
+}
+
+maps=""
+count=0
+IFS_OLD="$IFS"
+IFS=';'
+for entry in ${SWBF_MAPS:-bes2r}; do
+    IFS="$IFS_OLD"
+    # shellcheck disable=SC2086 # split the entry into map and ticket counts
+    set -- $entry
+    IFS=';'
+    [ "$#" -eq 0 ] && continue
+
+    map="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$map" in
+        [a-z][a-z][a-z][0-9][acir]) ;;
+        *)
+            echo "SWBF_MAPS: '$1' is not a map code (e.g. bes2r, tat2i, hot1i)." >&2
+            exit 1
+            ;;
+    esac
+    check_map "$map" || exit 1
+
+    case "$#" in
+        1) maps="$maps $map" ;;
+        3)
+            if ! is_number "$2" || ! is_number "$3"; then
+                echo "SWBF_MAPS: ticket counts for '$map' must be numbers: '$entry'" >&2
+                exit 1
+            fi
+            maps="$maps $map $2 $3"
+            ;;
+        *)
+            echo "SWBF_MAPS: expected 'map' or 'map tickets1 tickets2', got '$entry'" >&2
+            exit 1
+            ;;
+    esac
+    count=$((count + 1))
+done
+IFS="$IFS_OLD"
+
+if [ "$count" -eq 0 ]; then
+    echo "SWBF_MAPS is empty." >&2
+    exit 1
+fi
+
+# Build the command line. Arguments with spaces (the server name) stay single arguments.
+set -- /norender /nosound /lan /autonet dedicated \
+    /gamename "${SWBF_SERVER_NAME:-Star Wars Battlefront Server}"
+
+[ -n "$SWBF_MAX_PLAYERS" ]         && set -- "$@" /playerlimit "$SWBF_MAX_PLAYERS"
+[ -n "$SWBF_MIN_PLAYERS" ]         && set -- "$@" /playercount "$SWBF_MIN_PLAYERS"
+[ -n "$SWBF_BOTS" ]                && set -- "$@" /bots "$SWBF_BOTS"
+[ -n "$SWBF_DIFFICULTY" ]          && set -- "$@" /difficulty "$SWBF_DIFFICULTY"
+[ -n "$SWBF_SPAWN_INVINCIBILITY" ] && set -- "$@" /spawn "$SWBF_SPAWN_INVINCIBILITY"
+[ -n "$SWBF_TPS" ]                 && set -- "$@" /tps "$SWBF_TPS"
+[ -n "$SWBF_THROTTLE" ]            && set -- "$@" /throttle "$SWBF_THROTTLE"
+is_true "${SWBF_TEAM_DAMAGE:-true}" || set -- "$@" /noteamdamage
+is_true "${SWBF_AUTO_AIM:-true}"    || set -- "$@" /noaim
+is_true "${SWBF_SIDE_SELECT:-false}" && set -- "$@" /sideselect
+
+# The passwords are left out of the echoed command line
+shown="$*"
+[ -n "$SWBF_PASSWORD" ]       && { set -- "$@" /password "$SWBF_PASSWORD"; shown="$shown /password ****"; }
+[ -n "$SWBF_ADMIN_PASSWORD" ] && { set -- "$@" /adminpw "$SWBF_ADMIN_PASSWORD"; shown="$shown /adminpw ****"; }
+
+# shellcheck disable=SC2086 # SWBF_EXTRA_ARGS, START_ARGS and the map list are split on purpose
+set -- "$@" $SWBF_EXTRA_ARGS $start_args $maps
+shown="$shown $SWBF_EXTRA_ARGS $start_args $maps"
+
+echo "Starting: Battlefront.exe $shown"
+echo "Rotation: $count map(s)"
+
+export WINE_WORKDIR="$game"
+
+# Wine doesn't pass SIGTERM on to the game, so `docker stop` would wait out its timeout. Run the
+# server in the background and end it with wineserver -k instead.
+wine-run Battlefront.exe "$@" &
+pid=$!
+trap 'wineserver -k' TERM INT
+wait "$pid" || true
+wait "$pid"
